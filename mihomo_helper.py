@@ -9,7 +9,11 @@ import urllib.error
 import urllib.parse
 import subprocess
 import shutil
-import yaml
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 MIXED_PORT = 7890
 SOCKS_PORT = 7891
@@ -35,38 +39,23 @@ def _pidfile(ext_dir, profile_id):
     return os.path.join(ext_dir, "configs", f"{profile_id}.pid")
 
 
-def read_config(ext_dir, profile_id):
-    path = os.path.join(ext_dir, "configs", f"{profile_id}.yaml")
-    with open(path) as f:
-        return yaml.safe_load(f)
-
-
 def port_in_use(port):
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def generate_config(ext_dir, profile_id):
-    config = read_config(ext_dir, profile_id)
-    overrides = {
-        "mixed-port": MIXED_PORT,
-        "socks-port": SOCKS_PORT,
-        "allow-lan": False,
-        "mode": "rule",
-        "log-level": "warning",
-        "external-controller": CONTROLLER,
-        "tun": {
-            "enable": True,
-            "stack": "gvisor",
-            "dns-hijack": ["any:53"],
-            "auto-route": True,
-            "auto-detect-interface": True,
-        },
-    }
-    for k, v in overrides.items():
-        config[k] = v
-    return config
+def get_binary_path(ext_dir):
+    candidates = [
+        os.path.join(ext_dir, "bin", "mihomo"),
+        os.path.expanduser("~/.local/share/quick-vpn/bin/mihomo"),
+        shutil.which("mihomo"),
+        shutil.which("clash-meta"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return os.path.join(ext_dir, "bin", "mihomo")
 
 
 def setup_workdir(ext_dir, profile_id):
@@ -79,11 +68,54 @@ def setup_workdir(ext_dir, profile_id):
         if os.path.exists(src) and not os.path.exists(dst):
             shutil.copy2(src, dst)
 
-    config = generate_config(ext_dir, profile_id)
-    config_path = os.path.join(workdir, "config.yaml")
-    with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-    return workdir, config
+    config_src = os.path.join(ext_dir, "configs", f"{profile_id}.yaml")
+    config_dst = os.path.join(workdir, "config.yaml")
+
+    overrides = {
+        "mixed-port": MIXED_PORT,
+        "socks-port": SOCKS_PORT,
+        "allow-lan": False,
+        "mode": "rule",
+        "log-level": "warning",
+        "external-controller": CONTROLLER,
+        "tun": {
+            "enable": False,
+        },
+    }
+
+    if yaml and os.path.exists(config_src):
+        try:
+            with open(config_src) as f:
+                config = yaml.safe_load(f)
+            if isinstance(config, dict):
+                for k, v in overrides.items():
+                    config[k] = v
+                with open(config_dst, "w") as f:
+                    yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+                return workdir, config
+        except Exception:
+            pass
+
+    # Zero-dependency fallback: prepend overrides
+    overrides_text = (
+        f"mixed-port: {MIXED_PORT}\n"
+        f"socks-port: {SOCKS_PORT}\n"
+        "allow-lan: false\n"
+        "mode: rule\n"
+        "log-level: warning\n"
+        f"external-controller: {CONTROLLER}\n"
+        "tun:\n"
+        "  enable: false\n"
+    )
+    content = ""
+    if os.path.exists(config_src):
+        with open(config_src) as f:
+            content = f.read()
+
+    with open(config_dst, "w") as f:
+        f.write(overrides_text + "\n" + content)
+
+    return workdir, None
 
 
 def wait_for_api(timeout=15):
@@ -172,7 +204,10 @@ def cmd_start(ext_dir, profile_id):
         print(f"Port {MIXED_PORT} already in use")
         sys.exit(1)
 
-    bin_path = os.path.join(ext_dir, "bin", "mihomo")
+    bin_path = get_binary_path(ext_dir)
+    if not os.path.exists(bin_path):
+        print(f"Mihomo binary not found at {bin_path}")
+        sys.exit(1)
     workdir, _ = setup_workdir(ext_dir, profile_id)
     logfile = os.path.join(workdir, "mihomo.log")
 

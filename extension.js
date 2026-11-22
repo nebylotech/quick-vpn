@@ -75,7 +75,7 @@ function logCrash(storePath, message, stderr) {
     let entry = `[${ts}] ${message}`;
     if (stderr) entry += `\n  stderr: ${stderr}`;
     entry += '\n';
-    log(entry.trim());
+    console.log(entry.trim());
     try {
         const [ok, data] = GLib.file_get_contents(logFile);
         let existing = '';
@@ -699,7 +699,7 @@ export default class QuickVpnExtension extends Extension {
             const stylesheetFile = Gio.File.new_for_path(`${this.path}/stylesheet.css`);
             this._stylesheetId = themeContext.get_theme().load_stylesheet(stylesheetFile);
         } catch (e) {
-            log(`Quick VPN: stylesheet load error: ${e}`);
+            console.log(`Quick VPN: stylesheet load error: ${e}`);
         }
 
         this._indicator = new QuickSettings.SystemIndicator();
@@ -739,7 +739,6 @@ export default class QuickVpnExtension extends Extension {
             this._toggle = null;
         }
         if (this._indicator) {
-            this._indicator.quickSettingsItems.forEach(item => item.destroy());
             this._indicator.destroy();
             this._indicator = null;
         }

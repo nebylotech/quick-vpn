@@ -150,6 +150,51 @@ def parse_sub_info(sub_info_raw):
     return upload, download, total, expire
 
 
+def parse_clash_yaml_simple(content):
+    proxies = []
+    in_proxies = False
+    current_proxy = None
+    for line in content.splitlines():
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+        if line.startswith("proxies:"):
+            in_proxies = True
+            continue
+        elif in_proxies and line and not line[0].isspace() and not trimmed.startswith("-"):
+            in_proxies = False
+            break
+        if in_proxies:
+            if trimmed.startswith("- "):
+                if current_proxy:
+                    proxies.append(current_proxy)
+                current_proxy = {}
+                rest = trimmed[2:].strip()
+                if ":" in rest:
+                    k, v = rest.split(":", 1)
+                    current_proxy[k.strip(" \"'")] = v.strip(" \"'")
+            elif current_proxy is not None and ":" in trimmed:
+                k, v = trimmed.split(":", 1)
+                current_proxy[k.strip(" \"'")] = v.strip(" \"'")
+    if current_proxy:
+        proxies.append(current_proxy)
+
+    res = []
+    for p in proxies:
+        port = p.get('port', 0)
+        try:
+            port = int(port)
+        except Exception:
+            port = 0
+        res.append({
+            'name': p.get('name', ''),
+            'type': p.get('type', ''),
+            'server': p.get('server', ''),
+            'port': port,
+        })
+    return res
+
+
 def main():
     config_path = sys.argv[1]
     sub_info_raw = sys.argv[2] if len(sys.argv) > 2 else ''
@@ -158,7 +203,7 @@ def main():
     content = open(config_path).read()
     proxies = []
 
-    # Try Clash YAML format first
+    # Try Clash YAML format first (with PyYAML if present)
     if yaml:
         try:
             data = yaml.safe_load(content)
@@ -173,6 +218,24 @@ def main():
                 upload, download, total, expire = parse_sub_info(sub_info_raw)
                 print(json.dumps({
                     'proxies': proxies,
+                    'upload': upload,
+                    'download': download,
+                    'total': total,
+                    'expire': expire,
+                    'label': decode_base64_header(profile_title_raw),
+                }))
+                return
+        except Exception:
+            pass
+
+    # Try Clash YAML fallback parser without PyYAML
+    if 'proxies:' in content:
+        try:
+            parsed_proxies = parse_clash_yaml_simple(content)
+            if parsed_proxies:
+                upload, download, total, expire = parse_sub_info(sub_info_raw)
+                print(json.dumps({
+                    'proxies': parsed_proxies,
                     'upload': upload,
                     'download': download,
                     'total': total,
