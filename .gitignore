@@ -5,3 +5,5 @@ __pycache__/
 configs/
 profiles.json
 .hwid
+bin/
+crash.log

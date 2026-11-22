@@ -16,16 +16,17 @@ Manage VPN subscriptions from GNOME quick settings panel.
 
 - GNOME Shell 50, 51
 - Python 3
-- Mihomo core (install via `./install_core.sh` or system package `mihomo`)
+- Mihomo core (can be installed with 1-click directly from the extension menu, or via `python3 mihomo_helper.py . install_core` or system package `mihomo`)
 
 ## Installation
 
 ```bash
 git clone https://github.com/nebylotech/quick-vpn.git
-cd quick-vpn
-./install_core.sh
-ln -s "$(pwd)" ~/.local/share/gnome-shell/extensions/quick-vpn@nolune
+cp -r quick-vpn ~/.local/share/gnome-shell/extensions/quick-vpn@nolune
+gnome-extensions enable quick-vpn@nolune
 ```
+
+If Mihomo core is not installed on your system, open the Quick VPN menu in the top bar and click **"Скачать и установить ядро автоматически"**.
 
 Restart GNOME Shell or log out and log back in, then enable the extension:
 ```bash

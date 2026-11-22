@@ -12,6 +12,23 @@ import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 
 const SHELL_VERSION = Number.parseInt(Config.PACKAGE_VERSION.split('.')[0], 10);
 
+function getMihomoPath(storePath) {
+    const candidates = [
+        `${GLib.get_home_dir()}/.local/share/quick-vpn/bin/mihomo`,
+        '/usr/local/bin/mihomo',
+        '/usr/bin/mihomo',
+        `${storePath}/bin/mihomo`,
+    ];
+    for (const c of candidates) {
+        if (GLib.file_test(c, GLib.FileTest.IS_EXECUTABLE)) return c;
+    }
+    const inPath = GLib.find_program_in_path('mihomo');
+    if (inPath) return inPath;
+    const metaInPath = GLib.find_program_in_path('clash-meta');
+    if (metaInPath) return metaInPath;
+    return null;
+}
+
 function boxOrientation(isVertical = true) {
     if (SHELL_VERSION >= 51) {
         return {
@@ -137,8 +154,11 @@ class QuickVpnButton extends PanelMenu.Button {
         this._activeProfileId = null;
         this._isConnected = false;
         this._isFetching = false;
+        this._isInstallingCore = false;
         this._nodePingLabels = new Map();
         this._nodeItems = [];
+        this._signals = [];
+        this._timeouts = [];
 
         // Top bar widget
         this._box = new St.BoxLayout({ style_class: 'panel-status-indicators-box' });
@@ -197,10 +217,127 @@ class QuickVpnButton extends PanelMenu.Button {
         }
     }
 
+    _connectSignal(actor, signal, callback) {
+        const id = actor.connect(signal, callback);
+        this._signals.push({ actor, id });
+        return id;
+    }
+
+    _addTimeout(interval, callback) {
+        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, interval, () => {
+            this._timeouts = this._timeouts.filter(t => t !== id);
+            return callback();
+        });
+        this._timeouts.push(id);
+        return id;
+    }
+
+    destroy() {
+        for (const { actor, id } of this._signals) {
+            try {
+                actor.disconnect(id);
+            } catch {}
+        }
+        this._signals = [];
+        for (const id of this._timeouts) {
+            try {
+                GLib.Source.remove(id);
+            } catch {}
+        }
+        this._timeouts = [];
+        super.destroy();
+    }
+
+    _downloadAndInstallCore(downloadBtn, progressBox, progressText, percentLabel, progressTrack, progressFill, statusLabel) {
+        if (this._isInstallingCore) return;
+        this._isInstallingCore = true;
+
+        const updateProgress = (pct, msg) => {
+            if (percentLabel) percentLabel.text = `${pct}%`;
+            if (progressText && msg) progressText.text = msg;
+            if (progressTrack && progressFill) {
+                const totalWidth = progressTrack.get_width() > 50 ? progressTrack.get_width() : 300;
+                const targetWidth = Math.max(12, Math.round((totalWidth * pct) / 100));
+                try {
+                    progressFill.ease({
+                        width: targetWidth,
+                        duration: 250,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    });
+                } catch {
+                    progressFill.width = targetWidth;
+                }
+            }
+        };
+
+        updateProgress(2, _('Подключение к GitHub...'));
+
+        const scriptPath = `${this._storePath}/mihomo_helper.py`;
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(
+                ['python3', scriptPath, this._storePath, 'install_core'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+        } catch (e) {
+            this._isInstallingCore = false;
+            downloadBtn.visible = true;
+            progressBox.visible = false;
+            logCrash(this._storePath, `Subprocess launch error: ${e}`);
+            return;
+        }
+
+        const stdoutPipe = proc.get_stdout_pipe();
+        const stdoutStream = new Gio.DataInputStream({ base_stream: stdoutPipe });
+
+        const readLine = () => {
+            stdoutStream.read_line_async(GLib.PRIORITY_DEFAULT, null, (stream, res) => {
+                try {
+                    const [line] = stream.read_line_finish_utf8(res);
+                    if (line !== null) {
+                        const trimmed = line.trim();
+                        if (trimmed.startsWith('PROGRESS:')) {
+                            const parts = trimmed.split(':');
+                            const pct = parseInt(parts[1], 10);
+                            const msg = parts.slice(2).join(':');
+                            updateProgress(pct, msg);
+                        }
+                        readLine();
+                    }
+                } catch {}
+            });
+        };
+        readLine();
+
+        proc.wait_check_async(null, (proc, res) => {
+            this._isInstallingCore = false;
+            try {
+                proc.wait_check_finish(res);
+                updateProgress(100, _('Ядро успешно установлено!'));
+                Main.notify(_('Quick VPN'), _('✅ Ядро Mihomo успешно установлено!'));
+                this._addTimeout(800, () => {
+                    this._buildUi();
+                    return GLib.SOURCE_REMOVE;
+                });
+            } catch (e) {
+                downloadBtn.visible = true;
+                progressBox.visible = false;
+                downloadBtn.reactive = true;
+                downloadBtn.label = _('❌ Ошибка установки. Повторить?');
+                if (statusLabel) {
+                    statusLabel.text = `Ошибка установки ядра: ${e.message || e}`;
+                }
+                logCrash(this._storePath, `Install core failed: ${e}`);
+            }
+        });
+    }
+
     _buildUi() {
         this.menu.removeAll();
         this._nodePingLabels.clear();
         this._nodeItems = [];
+
+        const mihomoPath = getMihomoPath(this._storePath);
 
         // 1. Header Card with Quick Toggle
         const headerCard = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
@@ -215,17 +352,25 @@ class QuickVpnButton extends PanelMenu.Button {
         });
         titleBox.add_child(appTitle);
 
+        let statusText = this._isConnected ? _('● Подключено') : _('○ Отключено');
+        let statusClass = this._isConnected ? 'quickvpn-badge-connected' : 'quickvpn-badge-disconnected';
+        if (!mihomoPath) {
+            statusText = _('⚠️ Ядро не найдено');
+            statusClass = 'quickvpn-badge-warning';
+        }
+
         this._statusBadge = new St.Label({
-            text: this._isConnected ? _('● Подключено') : _('○ Отключено'),
-            style_class: this._isConnected ? 'quickvpn-badge-connected' : 'quickvpn-badge-disconnected',
+            text: statusText,
+            style_class: statusClass,
             y_align: Clutter.ActorAlign.CENTER,
         });
         titleBox.add_child(this._statusBadge);
         headerBox.add_child(titleBox);
 
         // Power Switch
-        this._switch = new PopupMenu.Switch(this._isConnected);
-        this._switch.connect('notify::state', () => {
+        this._switch = new PopupMenu.Switch(this._isConnected && !!mihomoPath);
+        this._switch.reactive = !!mihomoPath;
+        this._connectSignal(this._switch, 'notify::state', () => {
             if (this._switch.state) {
                 this._connectActive();
             } else {
@@ -237,6 +382,82 @@ class QuickVpnButton extends PanelMenu.Button {
         headerCard.add_child(headerBox);
         this.menu.addMenuItem(headerCard);
 
+        // Missing Core Card (if Mihomo is not yet downloaded)
+        if (!mihomoPath) {
+            const coreCard = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+            coreCard.add_style_class_name('quickvpn-card');
+            coreCard.style = 'background-color: rgba(220, 165, 0, 0.12); border: 1px solid rgba(220, 165, 0, 0.35); border-radius: 12px; margin: 6px; padding: 12px;';
+
+            const coreBox = new St.BoxLayout({ ...boxOrientation(true), x_expand: true });
+
+            const coreHeader = new St.Label({
+                text: _('⚙️ Требуется ядро Mihomo'),
+                style: 'font-weight: 800; font-size: 13px; color: #f6d32d; margin-bottom: 4px;',
+            });
+            coreBox.add_child(coreHeader);
+
+            const coreDesc = new St.Label({
+                text: _('Для работы VPN требуется ядро Mihomo (Clash.Meta). Чтобы соответствовать правилам каталога GNOME Extensions, бинарник не поставляется внутри архива.\nНажмите кнопку ниже, чтобы установить его автоматически в ~/.local/share/quick-vpn/bin/'),
+                style: 'font-size: 11px; color: #deddda; margin-bottom: 10px;',
+            });
+            coreDesc.clutter_text.set_line_wrap(true);
+            coreBox.add_child(coreDesc);
+
+            const downloadBtn = new St.Button({
+                label: this._isInstallingCore ? _('⏳ Установка ядра...') : _('📥 Скачать и установить ядро автоматически'),
+                style_class: 'quickvpn-action-btn',
+                style: 'background-color: #3584e4; color: white; font-weight: bold; padding: 8px 12px; border-radius: 8px; text-align: center;',
+                can_focus: !this._isInstallingCore,
+                reactive: !this._isInstallingCore,
+                visible: !this._isInstallingCore,
+            });
+
+            // Animated Progress Bar Container
+            const progressBox = new St.BoxLayout({ ...boxOrientation(true), x_expand: true, visible: this._isInstallingCore, style: 'margin-top: 6px;' });
+
+            const progressHeader = new St.BoxLayout({ ...boxOrientation(false), x_expand: true });
+            const progressText = new St.Label({
+                text: _('Подготовка...'),
+                style: 'font-size: 11px; font-weight: 600; color: #deddda;',
+                x_expand: true,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            progressHeader.add_child(progressText);
+
+            const percentLabel = new St.Label({
+                text: '0%',
+                style: 'font-size: 11px; font-weight: 800; color: #3584e4;',
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            progressHeader.add_child(percentLabel);
+            progressBox.add_child(progressHeader);
+
+            // Track & Fill bar
+            const progressTrack = new St.Bin({
+                style_class: 'quickvpn-progress-track',
+                x_expand: true,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            const progressFill = new St.Bin({
+                style_class: 'quickvpn-progress-fill',
+                x_align: Clutter.ActorAlign.START,
+            });
+            progressFill.width = 12;
+            progressTrack.set_child(progressFill);
+            progressBox.add_child(progressTrack);
+
+            this._connectSignal(downloadBtn, 'clicked', () => {
+                downloadBtn.visible = false;
+                progressBox.visible = true;
+                this._downloadAndInstallCore(downloadBtn, progressBox, progressText, percentLabel, progressTrack, progressFill, coreDesc);
+            });
+            coreBox.add_child(downloadBtn);
+            coreBox.add_child(progressBox);
+
+            coreCard.add_child(coreBox);
+            this.menu.addMenuItem(coreCard);
+        }
+
         if (this._profiles.length === 0) {
             const emptyItem = new PopupMenu.PopupMenuItem(_('Нет добавленных подписок'), { reactive: false });
             emptyItem.style = 'text-align: center; color: #9a9996; padding: 16px 0;';
@@ -247,6 +468,30 @@ class QuickVpnButton extends PanelMenu.Button {
 
         const activeProfile = this._profiles.find(p => p.id === this._activeProfileId) || this._profiles[0];
         if (!this._activeProfileId) this._activeProfileId = activeProfile.id;
+
+        // Multi-Profile Switcher (if multiple subscriptions exist)
+        if (this._profiles.length > 1) {
+            const selectorItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+            selectorItem.style = 'padding: 4px 6px;';
+            const selectorBox = new St.BoxLayout({ ...boxOrientation(false), x_expand: true });
+
+            for (const p of this._profiles) {
+                const isSelected = p.id === activeProfile.id;
+                const pBtn = new St.Button({
+                    label: p.label || _('Подписка'),
+                    style_class: 'quickvpn-badge',
+                    style: `margin-right: 6px; padding: 4px 10px; border-radius: 8px; ${isSelected ? 'background-color: #3584e4; color: white; font-weight: bold;' : 'color: #deddda;'}`,
+                    can_focus: true,
+                });
+                this._connectSignal(pBtn, 'clicked', () => {
+                    this._activeProfileId = p.id;
+                    this._buildUi();
+                });
+                selectorBox.add_child(pBtn);
+            }
+            selectorItem.add_child(selectorBox);
+            this.menu.addMenuItem(selectorItem);
+        }
 
         // 2. Profile Card (Adwaita Card style)
         const profileCard = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
@@ -307,7 +552,7 @@ class QuickVpnButton extends PanelMenu.Button {
             style_class: 'quickvpn-search-entry',
             style: 'margin-right: 8px;',
         });
-        searchEntry.clutter_text.connect('text-changed', () => {
+        this._connectSignal(searchEntry.clutter_text, 'text-changed', () => {
             const query = searchEntry.get_text().toLowerCase().trim();
             for (const item of this._nodeItems) {
                 const match = !query || item._nodeName.toLowerCase().includes(query);
@@ -322,7 +567,7 @@ class QuickVpnButton extends PanelMenu.Button {
             y_align: Clutter.ActorAlign.CENTER,
             can_focus: true,
         });
-        pingBtn.connect('clicked', () => this._runLivePing(activeProfile, pingBtn));
+        this._connectSignal(pingBtn, 'clicked', () => this._runLivePing(activeProfile, pingBtn));
         controlsBox.add_child(pingBtn);
 
         controlsItem.add_child(controlsBox);
@@ -419,7 +664,7 @@ class QuickVpnButton extends PanelMenu.Button {
             style: 'color: #e01b24; margin-right: 8px;',
             can_focus: true,
         });
-        removeBtn.connect('clicked', () => {
+        this._connectSignal(removeBtn, 'clicked', () => {
             this._removeProfile(activeProfile);
         });
         footerBox.add_child(removeBtn);
@@ -450,7 +695,7 @@ class QuickVpnButton extends PanelMenu.Button {
             can_focus: true,
             y_align: Clutter.ActorAlign.CENTER,
         });
-        addBtn.connect('clicked', () => {
+        this._connectSignal(addBtn, 'clicked', () => {
             const text = urlEntry.get_text().trim();
             if (!text) return;
             const configUrl = extractConfigUrl(text);

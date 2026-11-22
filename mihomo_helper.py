@@ -47,23 +47,28 @@ def port_in_use(port):
 
 def get_binary_path(ext_dir):
     candidates = [
-        os.path.join(ext_dir, "bin", "mihomo"),
         os.path.expanduser("~/.local/share/quick-vpn/bin/mihomo"),
         shutil.which("mihomo"),
         shutil.which("clash-meta"),
+        "/usr/local/bin/mihomo",
+        "/usr/bin/mihomo",
+        os.path.join(ext_dir, "bin", "mihomo"),
     ]
     for c in candidates:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return c
-    return os.path.join(ext_dir, "bin", "mihomo")
+    return None
 
 
 def setup_workdir(ext_dir, profile_id):
     workdir = _workdir(profile_id)
     os.makedirs(workdir, exist_ok=True)
 
+    local_bin = os.path.expanduser("~/.local/share/quick-vpn/bin")
     for f in ["GeoIP.dat", "GeoSite.dat", "geoip.metadb"]:
-        src = os.path.join(ext_dir, "bin", f)
+        src = os.path.join(local_bin, f)
+        if not os.path.exists(src):
+            src = os.path.join(ext_dir, "bin", f)
         dst = os.path.join(workdir, f)
         if os.path.exists(src) and not os.path.exists(dst):
             shutil.copy2(src, dst)
@@ -303,9 +308,114 @@ def cmd_dryrun(ext_dir, profile_id):
         print(f"  {g.get('name')} ({g.get('type')}) -> {g.get('proxies')}")
 
 
+def cmd_check_core(ext_dir):
+    path = get_binary_path(ext_dir)
+    if path:
+        try:
+            ver = subprocess.check_output([path, "-v"], text=True).strip()
+            print(json.dumps({"installed": True, "path": path, "version": ver}))
+            return
+        except Exception:
+            pass
+    print(json.dumps({"installed": False}))
+
+
+def download_file_progress(url, dst_path, user_agent, start_pct, end_pct, desc):
+    print(f"PROGRESS:{start_pct}:{desc}", flush=True)
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(req, timeout=90) as resp, open(dst_path, "wb") as out_f:
+        total_size = resp.headers.get("Content-Length")
+        total_size = int(total_size) if total_size and total_size.isdigit() else None
+        downloaded = 0
+        chunk_size = 128 * 1024
+        last_pct = start_pct
+        while True:
+            chunk = resp.read(chunk_size)
+            if not chunk:
+                break
+            out_f.write(chunk)
+            downloaded += len(chunk)
+            if total_size and total_size > 0:
+                fraction = downloaded / total_size
+                curr_pct = int(start_pct + fraction * (end_pct - start_pct))
+                if curr_pct - last_pct >= 2:
+                    last_pct = curr_pct
+                    print(f"PROGRESS:{curr_pct}:{desc}", flush=True)
+    print(f"PROGRESS:{end_pct}:{desc}", flush=True)
+
+
+def cmd_install_core(ext_dir):
+    dest_dir = os.path.expanduser("~/.local/share/quick-vpn/bin")
+    os.makedirs(dest_dir, exist_ok=True)
+
+    arch = os.uname().machine
+    if arch == "x86_64":
+        mihomo_arch = "linux-amd64-compatible"
+    elif arch == "aarch64":
+        mihomo_arch = "linux-arm64"
+    elif arch in ("i386", "i686"):
+        mihomo_arch = "linux-386"
+    else:
+        print(f"Unsupported architecture: {arch}", file=sys.stderr)
+        sys.exit(1)
+
+    print("PROGRESS:2:Поиск актуального релиза Mihomo...", flush=True)
+    tag = "v1.19.34"
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest",
+            headers={"User-Agent": "quick-vpn-extension"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("tag_name"):
+                tag = data["tag_name"]
+    except Exception as e:
+        log_crash(ext_dir, f"Failed to fetch latest tag, using fallback {tag}: {e}")
+
+    download_url = f"https://github.com/MetaCubeX/mihomo/releases/download/{tag}/mihomo-{mihomo_arch}-{tag}.gz"
+
+    mihomo_bin = os.path.join(dest_dir, "mihomo")
+    temp_gz = os.path.join(dest_dir, "mihomo.gz.tmp")
+
+    try:
+        download_file_progress(download_url, temp_gz, "quick-vpn-extension", 5, 65, f"Загрузка Mihomo {tag}...")
+
+        print("PROGRESS:66:Распаковка ядра Mihomo...", flush=True)
+        import gzip
+        with gzip.open(temp_gz, "rb") as gz_in, open(mihomo_bin, "wb") as bin_out:
+            shutil.copyfileobj(gz_in, bin_out)
+
+        os.chmod(mihomo_bin, 0o755)
+    finally:
+        if os.path.exists(temp_gz):
+            os.remove(temp_gz)
+
+    geo_files = [
+        ("geoip.metadb", "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb", 70, 80, "Загрузка правил GeoIP (metadb)..."),
+        ("GeoSite.dat", "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat", 80, 88, "Загрузка категорий GeoSite..."),
+        ("GeoIP.dat", "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat", 88, 98, "Загрузка базы IP адресов..."),
+    ]
+    for fname, url, start_p, end_p, label in geo_files:
+        dst_path = os.path.join(dest_dir, fname)
+        try:
+            download_file_progress(url, dst_path, "quick-vpn-extension", start_p, end_p, label)
+        except Exception as e:
+            log_crash(ext_dir, f"Failed downloading {fname}: {e}")
+
+    print("PROGRESS:99:Проверка готовности ядра...", flush=True)
+    try:
+        ver = subprocess.check_output([mihomo_bin, "-v"], text=True).strip()
+        print("PROGRESS:100:Ядро успешно установлено!", flush=True)
+        print(json.dumps({"status": "ok", "version": tag, "binary": mihomo_bin}))
+    except Exception as e:
+        print(f"Failed to execute installed binary: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     if len(sys.argv) < 3:
-        print("Usage: mihomo_helper.py <ext_dir> <start|stop|switch|restart|dryrun> [args...]")
+        print("Usage: mihomo_helper.py <ext_dir> <start|stop|switch|restart|dryrun|check_core|install_core> [args...]")
         sys.exit(1)
 
     ext_dir = sys.argv[1]
@@ -334,6 +444,10 @@ def main():
             print("Missing profile_id")
             sys.exit(1)
         cmd_dryrun(ext_dir, sys.argv[3])
+    elif action == "check_core":
+        cmd_check_core(ext_dir)
+    elif action == "install_core":
+        cmd_install_core(ext_dir)
     else:
         print(f"Unknown action: {action}")
         sys.exit(1)
