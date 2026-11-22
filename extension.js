@@ -60,6 +60,15 @@ function truncateText(text, maxLen) {
     return text.substring(0, maxLen - 1) + '…';
 }
 
+function decodeNodeName(text) {
+    if (!text) return '';
+    try {
+        return decodeURIComponent(text).trim();
+    } catch {
+        return text.trim();
+    }
+}
+
 function getDomainFromUrl(url) {
     try {
         return GLib.Uri.parse(url, GLib.UriFlags.NONE).get_host();
@@ -227,8 +236,9 @@ const QuickVpnToggle = GObject.registerClass({
         this._nodeItems.clear();
 
         const profiles = this._profiles;
-        this._emptySection.visible = profiles.length === 0;
-        this._separator.visible = profiles.length > 0;
+        this._emptySection.actor.visible = profiles.length === 0;
+        this._emptyLabel.actor.visible = profiles.length === 0;
+        this._separator.actor.visible = profiles.length > 0;
 
         if (profiles.length === 0) {
             this._activeProfileId = null;
@@ -251,13 +261,13 @@ const QuickVpnToggle = GObject.registerClass({
             const submenu = item.menu;
             submenu.actor.add_style_class_name('quickvpn-submenu');
 
-        if (this._activeProfileId === profile.id) {
-            item.setOrnament(PopupMenu.Ornament.DOT);
-        } else {
+            if (this._activeProfileId === profile.id) {
+                item.setOrnament(PopupMenu.Ornament.DOT);
+            } else {
                 const connectItem = new PopupMenu.PopupMenuItem(_('✓ Connect'));
                 connectItem.connect('activate', () => {
                     if (!profile.selectedNode && profile.nodes?.length) {
-                        profile.selectedNode = profile.nodes[0].name;
+                        profile.selectedNode = decodeNodeName(profile.nodes[0].name);
                         this._saveProfiles();
                     }
                     this._activeProfileId = profile.id;
@@ -273,34 +283,48 @@ const QuickVpnToggle = GObject.registerClass({
             const headerItem = new PopupMenu.PopupMenuItem(_('Nodes:'), { reactive: false });
             submenu.addMenuItem(headerItem);
 
+            const scrollSection = new PopupMenu.PopupMenuSection();
+            const scrollView = new St.ScrollView({
+                style: 'max-height: 280px;',
+                hscrollbar_policy: St.PolicyType.NEVER,
+                vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            });
+            const nodesSection = new PopupMenu.PopupMenuSection();
+            scrollView.add_child(nodesSection.actor);
+            scrollSection.actor.add_child(scrollView);
+            submenu.addMenuItem(scrollSection);
+
             for (const node of (profile.nodes || [])) {
-                const portStr = node.port ? `:${node.port}` : '';
-                const nodeText = `${truncateText(node.name, 38)}  [${node.type}]`;
+                const cleanName = decodeNodeName(node.name);
+                const typeStr = node.type ? `  [${node.type.toUpperCase()}]` : '';
+                const nodeText = `${truncateText(cleanName, 36)}${typeStr}`;
                 const nodeItem = new PopupMenu.PopupMenuItem(nodeText);
                 nodeItem._profileId = profile.id;
                 nodeItem._nodeName = node.name;
 
-                if (profile.selectedNode === node.name) {
+                const currentSelected = decodeNodeName(profile.selectedNode);
+                if (currentSelected === cleanName || profile.selectedNode === node.name) {
                     nodeItem.setOrnament(PopupMenu.Ornament.DOT);
                 }
 
                 nodeItem.connect('activate', () => {
-                    profile.selectedNode = node.name;
+                    profile.selectedNode = cleanName;
                     this._updateNodeOrnaments(profile);
-                    this.setStatus(`${profile.label}: ${node.name}`);
+                    this.setStatus(`${profile.label}: ${cleanName}`);
                     this._saveProfiles();
                     if (this._activeProfileId !== profile.id) {
                         this._activeProfileId = profile.id;
                         this.checked = true;
                         this.emit('profile-activated', profile.id);
                     } else {
-                        this._callMihomo('switch', profile.id, node.name);
+                        this._callMihomo('switch', profile.id, cleanName);
                     }
-                    Main.notify(_('Quick VPN'), `${profile.label}: ${node.name}`);
+                    Main.notify(_('Quick VPN'), `${profile.label}: ${cleanName}`);
                 });
 
+                this._nodeItems.set(`${profile.id}:${cleanName}`, nodeItem);
                 this._nodeItems.set(`${profile.id}:${node.name}`, nodeItem);
-                submenu.addMenuItem(nodeItem);
+                nodesSection.addMenuItem(nodeItem);
             }
 
             submenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -561,7 +585,16 @@ const QuickVpnToggle = GObject.registerClass({
             const [ok, contents] = GLib.file_get_contents(`${this._storePath}/profiles.json`);
             if (ok && contents) {
                 const str = typeof contents === 'string' ? contents : new TextDecoder().decode(contents);
-                return JSON.parse(str);
+                const profiles = JSON.parse(str);
+                for (const p of profiles) {
+                    if (p.selectedNode) p.selectedNode = decodeNodeName(p.selectedNode);
+                    if (p.nodes) {
+                        for (const n of p.nodes) {
+                            n.name = decodeNodeName(n.name);
+                        }
+                    }
+                }
+                return profiles;
             }
         } catch (e) {
             logCrash(this._storePath, `Load error: ${e}`);
@@ -615,7 +648,8 @@ const QuickVpnToggle = GObject.registerClass({
             let msg = '';
             for (const r of results) {
                 const status = r.ping !== null ? `${r.ping}ms` : '✗';
-                msg += `${r.profileLabel}: ${truncateText(r.nodeName, 30)} — ${status}\n`;
+                const cleanNode = decodeNodeName(r.nodeName);
+                msg += `${r.profileLabel}: ${truncateText(cleanNode, 32)} — ${status}\n`;
             }
             Main.notify(_('Quick VPN — Ping'), msg.trim());
         });

@@ -46,7 +46,7 @@ def parse_vless(url):
     server_port = server_part.split(':')
     server = server_port[0]
     port = int(server_port[1]) if len(server_port) > 1 and server_port[1].isdigit() else 0
-    name = fragment or server
+    name = urllib.parse.unquote(fragment or server).strip()
     return {'name': name, 'type': 'vless', 'server': server, 'port': port}
 
 
@@ -56,8 +56,9 @@ def parse_vmess(url):
         padding = 4 - len(b64) % 4 if len(b64) % 4 else 0
         decoded = base64.b64decode(b64 + '=' * padding).decode('utf-8')
         data = json.loads(decoded)
+        name = urllib.parse.unquote(data.get('ps', '')).strip()
         return {
-            'name': data.get('ps', ''),
+            'name': name,
             'type': 'vmess',
             'server': data.get('add', ''),
             'port': data.get('port', 0),
@@ -77,7 +78,7 @@ def parse_trojan(url):
     server_port = server_part.split(':')
     server = server_port[0]
     port = int(server_port[1]) if len(server_port) > 1 and server_port[1].isdigit() else 0
-    name = fragment or server
+    name = urllib.parse.unquote(fragment or server).strip()
     return {'name': name, 'type': 'trojan', 'server': server, 'port': port}
 
 
@@ -95,9 +96,24 @@ def parse_ss(url):
             method = decoded.split(':')[0] if ':' in decoded else ''
         except Exception:
             method = ''
-        name = fragment or server
+        name = urllib.parse.unquote(fragment or server).strip()
         return {'name': name, 'type': 'ss', 'server': server, 'port': port, 'method': method}
-    return {'name': fragment or '', 'type': 'ss', 'server': '', 'port': 0}
+    return {'name': urllib.parse.unquote(fragment or '').strip(), 'type': 'ss', 'server': '', 'port': 0}
+
+
+def parse_hysteria2(url):
+    parsed = urllib.parse.urlparse(url)
+    fragment = parsed.fragment or ''
+    netloc = parsed.netloc
+    if '@' in netloc:
+        _, server_part = netloc.split('@', 1)
+    else:
+        server_part = netloc
+    server_port = server_part.split(':')
+    server = server_port[0]
+    port = int(server_port[1]) if len(server_port) > 1 and server_port[1].isdigit() else 0
+    name = urllib.parse.unquote(fragment or server).strip()
+    return {'name': name, 'type': 'hysteria2', 'server': server, 'port': port}
 
 
 def parse_ssr(url):
@@ -108,7 +124,8 @@ def parse_ssr(url):
         parts = decoded.split('/')[0].split(':')
         server = parts[0] if len(parts) >= 6 else ''
         port = int(parts[1]) if len(parts) >= 6 and parts[1].isdigit() else 0
-        return {'name': '', 'type': 'ssr', 'server': server, 'port': port}
+        name = urllib.parse.unquote(parts[5] if len(parts) > 5 else server).strip()
+        return {'name': name, 'type': 'ssr', 'server': server, 'port': port}
     except Exception:
         return {'name': '', 'type': 'ssr', 'server': '', 'port': 0}
 
@@ -127,6 +144,8 @@ def parse_proxy_links(text):
             proxies.append(parse_trojan(line))
         elif line.startswith('ss://'):
             proxies.append(parse_ss(line))
+        elif line.startswith('hysteria2://') or line.startswith('hy2://'):
+            proxies.append(parse_hysteria2(line))
         elif line.startswith('ssr://'):
             proxies.append(parse_ssr(line))
     return proxies
