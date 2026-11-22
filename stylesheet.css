@@ -1,7 +1,118 @@
-.quickvpn-profiles {
-    max-height: 480px;
+.quickvpn-menu {
+    min-width: 380px;
+    padding: 8px;
 }
 
-.quickvpn-submenu {
-    max-height: 420px;
+.quickvpn-card {
+    background-color: rgba(255, 255, 255, 0.07);
+    border-radius: 12px;
+    padding: 10px 14px;
+    margin: 4px 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.quickvpn-title {
+    font-weight: 800;
+    font-size: 14px;
+}
+
+.quickvpn-badge {
+    background-color: rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.quickvpn-badge-connected {
+    background-color: rgba(46, 194, 89, 0.22);
+    color: #57e389;
+    border-radius: 12px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 700;
+    border: 1px solid rgba(46, 194, 89, 0.4);
+}
+
+.quickvpn-badge-disconnected {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #9a9996;
+    border-radius: 12px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.quickvpn-type-badge {
+    background-color: rgba(53, 132, 228, 0.2);
+    color: #78aeed;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    margin-right: 6px;
+}
+
+.quickvpn-nodes-scroll {
+    max-height: 320px;
+    min-height: 80px;
+    padding: 2px;
+}
+
+.quickvpn-node-row {
+    padding: 6px 10px;
+    border-radius: 8px;
+    margin: 1px 2px;
+}
+
+.quickvpn-node-row:hover,
+.quickvpn-node-row:focus {
+    background-color: rgba(255, 255, 255, 0.12);
+}
+
+.quickvpn-node-selected {
+    background-color: rgba(53, 132, 228, 0.25);
+    border: 1px solid rgba(53, 132, 228, 0.4);
+}
+
+.quickvpn-ping-good {
+    color: #57e389;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.quickvpn-ping-med {
+    color: #f6d32d;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.quickvpn-ping-bad {
+    color: #e01b24;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.quickvpn-search-entry {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 6px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+}
+
+.quickvpn-search-entry:focus {
+    border: 1px solid #3584e4;
+}
+
+.quickvpn-action-btn {
+    border-radius: 8px;
+    padding: 5px 10px;
+    background-color: rgba(255, 255, 255, 0.08);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.quickvpn-action-btn:hover {
+    background-color: rgba(255, 255, 255, 0.16);
 }

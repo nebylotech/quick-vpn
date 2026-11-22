@@ -1,22 +1,31 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 
 import { Extension, gettext as _ } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
-import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
-
-const QuickSettingsMenu = Main.panel.statusArea.quickSettings;
 
 function bytesToGB(bytes) {
+    if (!bytes) return '0.0';
     return (bytes / (1024 * 1024 * 1024)).toFixed(1);
 }
 
 function formatDate(ts) {
     if (!ts) return '∞';
     return new Date(ts).toLocaleDateString();
+}
+
+function decodeNodeName(text) {
+    if (!text) return '';
+    try {
+        return decodeURIComponent(text).trim();
+    } catch {
+        return text.trim();
+    }
 }
 
 function extractConfigUrl(text) {
@@ -39,42 +48,6 @@ function extractConfigUrl(text) {
         return trimmed;
     }
     return null;
-}
-
-function parseLabelFromUrl(url) {
-    try {
-        const uri = GLib.Uri.parse(url, GLib.UriFlags.NONE);
-        const query = uri.get_query();
-        if (query) {
-            const params = GLib.Uri.parse_params(query, -1, '&', GLib.UriParamsFlags.NONE);
-            if (params.name) return params.name;
-        }
-        const fragment = uri.get_fragment();
-        if (fragment) return decodeURIComponent(fragment);
-    } catch {}
-    return null;
-}
-
-function truncateText(text, maxLen) {
-    if (!text || text.length <= maxLen) return text;
-    return text.substring(0, maxLen - 1) + '…';
-}
-
-function decodeNodeName(text) {
-    if (!text) return '';
-    try {
-        return decodeURIComponent(text).trim();
-    } catch {
-        return text.trim();
-    }
-}
-
-function getDomainFromUrl(url) {
-    try {
-        return GLib.Uri.parse(url, GLib.UriFlags.NONE).get_host();
-    } catch {
-        return 'Subscription';
-    }
 }
 
 function logCrash(storePath, message, stderr) {
@@ -128,7 +101,7 @@ function pingHost(host) {
                 try {
                     const [, stdout] = proc.communicate_utf8_finish(res);
                     const match = stdout.match(/time=(\d+\.?\d*)\s*ms/);
-                    resolve(match ? parseFloat(match[1]) : null);
+                    resolve(match ? Math.round(parseFloat(match[1])) : null);
                 } catch {
                     resolve(null);
                 }
@@ -139,290 +112,429 @@ function pingHost(host) {
     });
 }
 
-const QuickVpnToggle = GObject.registerClass({
-    Signals: {
-        'profile-activated': { param_types: [GObject.TYPE_STRING] },
-        'profile-deactivated': {},
-    },
-}, class QuickVpnToggle extends QuickSettings.QuickMenuToggle {
-    _init(iconPath) {
-        super._init({
-            title: _('Quick VPN'),
-            toggleMode: true,
-        });
+const QuickVpnButton = GObject.registerClass(
+class QuickVpnButton extends PanelMenu.Button {
+    _init(extension) {
+        super._init(0.0, _('Quick VPN'));
+        this._extension = extension;
+        this._storePath = extension.path;
 
         this._profiles = [];
         this._activeProfileId = null;
-        this._profileItems = new Map();
-        this._nodeItems = new Map();
-        this._storePath = '';
+        this._isConnected = false;
         this._isFetching = false;
+        this._nodePingLabels = new Map();
+        this._nodeItems = [];
 
-        const icon = Gio.FileIcon.new(Gio.File.new_for_path(iconPath));
-        this.menu.setHeader(icon, _('Quick VPN'), _('Select VPN profile'));
+        // Top bar widget
+        this._box = new St.BoxLayout({ style_class: 'panel-status-indicators-box' });
+        this._icon = new St.Icon({
+            gicon: Gio.FileIcon.new(Gio.File.new_for_path(`${extension.path}/icons/quickvpn-symbolic.svg`)),
+            style_class: 'system-status-icon',
+        });
+        this._box.add_child(this._icon);
 
-        this.connect('clicked', () => {
-            if (this.checked) {
-                let lastActive = this._profiles.find(p => p.id === this._activeProfileId);
-                if (!lastActive) {
-                    lastActive = this._profiles.find(p => p.selectedNode) || this._profiles[0];
-                    if (lastActive) this._activeProfileId = lastActive.id;
+        this._panelLabel = new St.Label({
+            text: '',
+            y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
+            style: 'margin-left: 5px; font-weight: bold; font-size: 11px;',
+        });
+        this._box.add_child(this._panelLabel);
+        this.add_child(this._box);
+
+        this.menu.box.add_style_class_name('quickvpn-menu');
+
+        this._loadProfiles();
+        this._buildUi();
+    }
+
+    _loadProfiles() {
+        try {
+            const [ok, contents] = GLib.file_get_contents(`${this._storePath}/profiles.json`);
+            if (ok && contents) {
+                const str = typeof contents === 'string' ? contents : new TextDecoder().decode(contents);
+                const profiles = JSON.parse(str);
+                for (const p of profiles) {
+                    if (p.selectedNode) p.selectedNode = decodeNodeName(p.selectedNode);
+                    if (p.nodes) {
+                        for (const n of p.nodes) {
+                            n.name = decodeNodeName(n.name);
+                        }
+                    }
                 }
-                if (lastActive && !lastActive.selectedNode && lastActive.nodes?.length) {
-                    lastActive.selectedNode = lastActive.nodes[0].name;
-                    this._saveProfiles();
-                }
-                if (lastActive) {
-                    this.emit('profile-activated', lastActive.id);
-                } else {
-                    this.checked = false;
-                }
-            } else {
-                this._activeProfileId = null;
-                this.emit('profile-deactivated');
+                this._profiles = profiles;
+                return;
             }
-            this._rebuildMenu();
-        });
-
-        this._emptySection = new PopupMenu.PopupMenuSection();
-        this.menu.addMenuItem(this._emptySection);
-
-        this._emptyLabel = new PopupMenu.PopupMenuItem(_('No profiles'));
-        this._emptyLabel.reactive = false;
-        this._emptySection.addMenuItem(this._emptyLabel);
-
-        this._profilesSection = new PopupMenu.PopupMenuSection();
-        this._profilesSection.actor.add_style_class_name('quickvpn-profiles');
-        this.menu.addMenuItem(this._profilesSection);
-
-        this._separator = new PopupMenu.PopupSeparatorMenuItem();
-        this.menu.addMenuItem(this._separator);
-
-        const entryItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
-        this._entry = new St.Entry({
-            hint_text: _('Paste subscription URL...'),
-            can_focus: true,
-            style_class: 'quickvpn-entry',
-        });
-        this._entry.clutter_text.connect('activate', () => this._addFromEntry());
-        entryItem.add_child(this._entry);
-        this.menu.addMenuItem(entryItem);
-
-        this._addBtn = new PopupMenu.PopupMenuItem(_('➕ Add'));
-        this._addBtn.connect('activate', () => this._addFromEntry());
-        this.menu.addMenuItem(this._addBtn);
-
-        this._statusItem = new PopupMenu.PopupMenuItem('');
-        this._statusItem.reactive = false;
-        this.menu.addMenuItem(this._statusItem);
-
-        this._pingItem = new PopupMenu.PopupMenuItem(_('Проверить пинг'));
-        this._pingItem.connect('activate', () => this._checkPing());
-        this.menu.addMenuItem(this._pingItem);
-
-        this.setStatus(_('No VPN'));
+        } catch (e) {
+            logCrash(this._storePath, `Load error: ${e}`);
+        }
+        this._profiles = [];
     }
 
-    set storePath(v) { this._storePath = v; }
-
-    setProfiles(profiles) {
-        this._profiles = profiles;
-        this._rebuildMenu();
+    _saveProfiles() {
+        try {
+            GLib.file_set_contents(
+                `${this._storePath}/profiles.json`,
+                JSON.stringify(this._profiles, null, 2)
+            );
+        } catch (e) {
+            logCrash(this._storePath, `Save error: ${e}`);
+        }
     }
 
-    _rebuildMenu() {
-        this._profilesSection.removeAll();
-        this._profileItems.clear();
-        this._nodeItems.clear();
+    _buildUi() {
+        this.menu.removeAll();
+        this._nodePingLabels.clear();
+        this._nodeItems = [];
 
-        const profiles = this._profiles;
-        this._emptySection.actor.visible = profiles.length === 0;
-        this._emptyLabel.actor.visible = profiles.length === 0;
-        this._separator.actor.visible = profiles.length > 0;
+        // 1. Header Card with Quick Toggle
+        const headerCard = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+        headerCard.add_style_class_name('quickvpn-card');
 
-        if (profiles.length === 0) {
-            this._activeProfileId = null;
-            this.checked = false;
-            this.setStatus(_('No VPN'));
+        const headerBox = new St.BoxLayout({ vertical: false, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        
+        const titleBox = new St.BoxLayout({ vertical: true, x_expand: true });
+        const appTitle = new St.Label({
+            text: _('Quick VPN'),
+            style_class: 'quickvpn-title',
+        });
+        titleBox.add_child(appTitle);
+
+        this._statusBadge = new St.Label({
+            text: this._isConnected ? _('● Подключено') : _('○ Отключено'),
+            style_class: this._isConnected ? 'quickvpn-badge-connected' : 'quickvpn-badge-disconnected',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        titleBox.add_child(this._statusBadge);
+        headerBox.add_child(titleBox);
+
+        // Power Switch
+        this._switch = new PopupMenu.Switch(this._isConnected);
+        this._switch.connect('notify::state', () => {
+            if (this._switch.state) {
+                this._connectActive();
+            } else {
+                this._disconnect();
+            }
+        });
+        headerBox.add_child(this._switch);
+
+        headerCard.add_child(headerBox);
+        this.menu.addMenuItem(headerCard);
+
+        if (this._profiles.length === 0) {
+            const emptyItem = new PopupMenu.PopupMenuItem(_('Нет добавленных подписок'), { reactive: false });
+            emptyItem.style = 'text-align: center; color: #9a9996; padding: 16px 0;';
+            this.menu.addMenuItem(emptyItem);
+            this._buildAddSection();
             return;
         }
 
-        for (const profile of profiles) {
-            const usedGB = bytesToGB((profile.upload || 0) + (profile.download || 0));
-            const totalGB = bytesToGB(profile.total || 0);
-            const expireStr = formatDate(profile.expire);
-            const traffic = profile.total
-                ? `${usedGB}/${totalGB} GB`
-                : `${usedGB} GB`;
-            const text = `${profile.label}  ${traffic}  до ${expireStr}`;
+        const activeProfile = this._profiles.find(p => p.id === this._activeProfileId) || this._profiles[0];
+        if (!this._activeProfileId) this._activeProfileId = activeProfile.id;
 
-            const item = new PopupMenu.PopupSubMenuMenuItem(text, true);
-            item._profileId = profile.id;
-            const submenu = item.menu;
-            submenu.actor.add_style_class_name('quickvpn-submenu');
+        // 2. Profile Card (Adwaita Card style)
+        const profileCard = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+        profileCard.add_style_class_name('quickvpn-card');
 
-            if (this._activeProfileId === profile.id) {
-                item.setOrnament(PopupMenu.Ornament.DOT);
-            } else {
-                const connectItem = new PopupMenu.PopupMenuItem(_('✓ Connect'));
-                connectItem.connect('activate', () => {
-                    if (!profile.selectedNode && profile.nodes?.length) {
-                        profile.selectedNode = decodeNodeName(profile.nodes[0].name);
-                        this._saveProfiles();
-                    }
-                    this._activeProfileId = profile.id;
-                    this.checked = true;
-                    this.emit('profile-activated', profile.id);
-                    this._rebuildMenu();
+        const profileBox = new St.BoxLayout({ vertical: true, x_expand: true });
+        
+        // Profile Name Row
+        const profileTop = new St.BoxLayout({ vertical: false, x_expand: true });
+        const profileName = new St.Label({
+            text: activeProfile.label || _('Подписка'),
+            style: 'font-weight: 800; font-size: 13px;',
+            x_expand: true,
+        });
+        profileTop.add_child(profileName);
+
+        const nodesCountBadge = new St.Label({
+            text: `${activeProfile.nodes?.length || 0} серверов`,
+            style_class: 'quickvpn-badge',
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        profileTop.add_child(nodesCountBadge);
+        profileBox.add_child(profileTop);
+
+        // Traffic & Expiry Badges Row
+        const statsRow = new St.BoxLayout({ vertical: false, style: 'margin-top: 6px;' });
+        const usedGB = bytesToGB((activeProfile.upload || 0) + (activeProfile.download || 0));
+        const totalGB = bytesToGB(activeProfile.total || 0);
+        const trafficText = activeProfile.total ? `${usedGB} / ${totalGB} GB` : `${usedGB} GB`;
+
+        const trafficBadge = new St.Label({
+            text: `📊 ${trafficText}`,
+            style_class: 'quickvpn-badge',
+            style: 'margin-right: 6px;',
+        });
+        statsRow.add_child(trafficBadge);
+
+        const expireDateStr = formatDate(activeProfile.expire);
+        const expireBadge = new St.Label({
+            text: `⏳ до ${expireDateStr}`,
+            style_class: 'quickvpn-badge',
+        });
+        statsRow.add_child(expireBadge);
+
+        profileBox.add_child(statsRow);
+        profileCard.add_child(profileBox);
+        this.menu.addMenuItem(profileCard);
+
+        // 3. Search Bar & Ping Action Header
+        const controlsItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+        controlsItem.style = 'padding: 4px 6px;';
+        const controlsBox = new St.BoxLayout({ vertical: false, x_expand: true });
+
+        const searchEntry = new St.Entry({
+            hint_text: _('🔍 Поиск сервера...'),
+            can_focus: true,
+            x_expand: true,
+            style_class: 'quickvpn-search-entry',
+            style: 'margin-right: 8px;',
+        });
+        searchEntry.clutter_text.connect('text-changed', () => {
+            const query = searchEntry.get_text().toLowerCase().trim();
+            for (const item of this._nodeItems) {
+                const match = !query || item._nodeName.toLowerCase().includes(query);
+                item.actor.visible = match;
+            }
+        });
+        controlsBox.add_child(searchEntry);
+
+        const pingBtn = new St.Button({
+            label: _('⚡ Пинг'),
+            style_class: 'quickvpn-action-btn',
+            y_align: Clutter.ActorAlign.CENTER,
+            can_focus: true,
+        });
+        pingBtn.connect('clicked', () => this._runLivePing(activeProfile, pingBtn));
+        controlsBox.add_child(pingBtn);
+
+        controlsItem.add_child(controlsBox);
+        this.menu.addMenuItem(controlsItem);
+
+        // 4. Scrollable Nodes List
+        const scrollSection = new PopupMenu.PopupMenuSection();
+        const scrollView = new St.ScrollView({
+            style_class: 'quickvpn-nodes-scroll',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+        });
+        const nodesContainer = new PopupMenu.PopupMenuSection();
+        scrollView.add_child(nodesContainer.actor);
+        scrollSection.actor.add_child(scrollView);
+        this.menu.addMenuItem(scrollSection);
+
+        const currentSelected = decodeNodeName(activeProfile.selectedNode);
+
+        for (const node of (activeProfile.nodes || [])) {
+            const cleanName = decodeNodeName(node.name);
+            const isSelected = cleanName === currentSelected || node.name === activeProfile.selectedNode;
+
+            const nodeItem = new PopupMenu.PopupBaseMenuItem({
+                style_class: `quickvpn-node-row ${isSelected ? 'quickvpn-node-selected' : ''}`,
+            });
+            nodeItem._nodeName = cleanName;
+
+            const rowBox = new St.BoxLayout({ vertical: false, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+
+            // Radio bullet / dot
+            const radioLabel = new St.Label({
+                text: isSelected ? '●' : '○',
+                style: `margin-right: 8px; font-size: 13px; color: ${isSelected ? '#3584e4' : '#9a9996'};`,
+            });
+            rowBox.add_child(radioLabel);
+
+            // Server Flag + Name
+            const nameLabel = new St.Label({
+                text: cleanName,
+                x_expand: true,
+                y_align: Clutter.ActorAlign.CENTER,
+                style: 'font-weight: 600; font-size: 12px;',
+            });
+            rowBox.add_child(nameLabel);
+
+            // Protocol Badge
+            if (node.type) {
+                const protoBadge = new St.Label({
+                    text: node.type.toUpperCase(),
+                    style_class: 'quickvpn-type-badge',
+                    y_align: Clutter.ActorAlign.CENTER,
                 });
-                submenu.addMenuItem(connectItem);
+                rowBox.add_child(protoBadge);
             }
 
-            submenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-            const headerItem = new PopupMenu.PopupMenuItem(_('Nodes:'), { reactive: false });
-            submenu.addMenuItem(headerItem);
-
-            const scrollSection = new PopupMenu.PopupMenuSection();
-            const scrollView = new St.ScrollView({
-                style: 'max-height: 280px;',
-                hscrollbar_policy: St.PolicyType.NEVER,
-                vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            // Inline Live Ping Label!
+            const pingLabel = new St.Label({
+                text: '—',
+                style_class: 'quickvpn-badge',
+                style: 'min-width: 42px; text-align: right;',
+                y_align: Clutter.ActorAlign.CENTER,
             });
-            const nodesSection = new PopupMenu.PopupMenuSection();
-            scrollView.add_child(nodesSection.actor);
-            scrollSection.actor.add_child(scrollView);
-            submenu.addMenuItem(scrollSection);
+            this._nodePingLabels.set(cleanName, pingLabel);
+            rowBox.add_child(pingLabel);
 
-            for (const node of (profile.nodes || [])) {
-                const cleanName = decodeNodeName(node.name);
-                const typeStr = node.type ? `  [${node.type.toUpperCase()}]` : '';
-                const nodeText = `${truncateText(cleanName, 36)}${typeStr}`;
-                const nodeItem = new PopupMenu.PopupMenuItem(nodeText);
-                nodeItem._profileId = profile.id;
-                nodeItem._nodeName = node.name;
+            nodeItem.add_child(rowBox);
 
-                const currentSelected = decodeNodeName(profile.selectedNode);
-                if (currentSelected === cleanName || profile.selectedNode === node.name) {
-                    nodeItem.setOrnament(PopupMenu.Ornament.DOT);
+            nodeItem.connect('activate', () => {
+                activeProfile.selectedNode = cleanName;
+                this._saveProfiles();
+                if (this._isConnected) {
+                    this._extension.callMihomo('switch', activeProfile.id, cleanName);
+                    this._updateStatusUi(activeProfile);
+                } else {
+                    this._connectActive();
                 }
-
-                nodeItem.connect('activate', () => {
-                    profile.selectedNode = cleanName;
-                    this._updateNodeOrnaments(profile);
-                    this.setStatus(`${profile.label}: ${cleanName}`);
-                    this._saveProfiles();
-                    if (this._activeProfileId !== profile.id) {
-                        this._activeProfileId = profile.id;
-                        this.checked = true;
-                        this.emit('profile-activated', profile.id);
-                    } else {
-                        this._callMihomo('switch', profile.id, cleanName);
-                    }
-                    Main.notify(_('Quick VPN'), `${profile.label}: ${cleanName}`);
-                });
-
-                this._nodeItems.set(`${profile.id}:${cleanName}`, nodeItem);
-                this._nodeItems.set(`${profile.id}:${node.name}`, nodeItem);
-                nodesSection.addMenuItem(nodeItem);
-            }
-
-            submenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-            const removeItem = new PopupMenu.PopupMenuItem(_('🗑 Remove'));
-            removeItem.connect('activate', () => {
-                this._removeProfile(profile);
-                this._activeProfileId = null;
-                this.checked = false;
-                this.emit('profile-deactivated');
+                this._buildUi();
             });
-            submenu.addMenuItem(removeItem);
 
-            this._profileItems.set(profile.id, item);
-            this._profilesSection.addMenuItem(item);
+            this._nodeItems.push(nodeItem);
+            nodesContainer.addMenuItem(nodeItem);
         }
 
-        const activeProfile = profiles.find(p => p.id === this._activeProfileId);
-        if (activeProfile) {
-            const usedGB = bytesToGB((activeProfile.upload || 0) + (activeProfile.download || 0));
-            const totalGB = bytesToGB(activeProfile.total || 0);
-            const traffic = activeProfile.total
-                ? `${usedGB}/${totalGB} GB`
-                : `${usedGB} GB`;
-            this.setStatus(`${activeProfile.label}  ${traffic}`);
-        } else {
-            this.setStatus(_('Select VPN'));
-        }
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        // 5. Actions: Remove profile / Add subscription
+        const footerItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+        const footerBox = new St.BoxLayout({ vertical: false, x_expand: true });
+
+        const removeBtn = new St.Button({
+            label: _('🗑 Удалить профиль'),
+            style_class: 'quickvpn-action-btn',
+            style: 'color: #e01b24; margin-right: 8px;',
+            can_focus: true,
+        });
+        removeBtn.connect('clicked', () => {
+            this._removeProfile(activeProfile);
+        });
+        footerBox.add_child(removeBtn);
+
+        footerItem.add_child(footerBox);
+        this.menu.addMenuItem(footerItem);
+
+        this._buildAddSection();
     }
 
-    _updateNodeOrnaments(profile) {
-        for (const [key, item] of this._nodeItems) {
-            const [pid, nodeName] = key.split(':');
-            if (pid === profile.id) {
-                item.setOrnament(nodeName === profile.selectedNode
-                    ? PopupMenu.Ornament.DOT
-                    : PopupMenu.Ornament.NONE);
+    _buildAddSection() {
+        const addSection = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
+        addSection.style = 'padding: 6px;';
+        const addBox = new St.BoxLayout({ vertical: false, x_expand: true });
+
+        const urlEntry = new St.Entry({
+            hint_text: _('Вставьте ссылку подписки...'),
+            can_focus: true,
+            x_expand: true,
+            style_class: 'quickvpn-search-entry',
+            style: 'margin-right: 6px;',
+        });
+        addBox.add_child(urlEntry);
+
+        const addBtn = new St.Button({
+            label: _('➕ Добавить'),
+            style_class: 'quickvpn-action-btn',
+            can_focus: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        addBtn.connect('clicked', () => {
+            const text = urlEntry.get_text().trim();
+            if (!text) return;
+            const configUrl = extractConfigUrl(text);
+            if (!configUrl) {
+                Main.notify(_('Quick VPN'), _('Некорректная ссылка подписки'));
+                return;
             }
+            this._fetchAndAddProfile(configUrl);
+            urlEntry.set_text('');
+        });
+        addBox.add_child(addBtn);
+
+        addSection.add_child(addBox);
+        this.menu.addMenuItem(addSection);
+    }
+
+    _runLivePing(profile, pingBtn) {
+        if (!profile.nodes || profile.nodes.length === 0) return;
+        pingBtn.set_label(_('⏳...'));
+
+        const promises = profile.nodes.map(async (n) => {
+            const cleanName = decodeNodeName(n.name);
+            const pingLabel = this._nodePingLabels.get(cleanName);
+            if (pingLabel) pingLabel.text = '...';
+
+            const ms = await pingHost(n.server);
+            if (pingLabel) {
+                if (ms !== null) {
+                    pingLabel.text = `${ms} ms`;
+                    if (ms < 100) pingLabel.style_class = 'quickvpn-ping-good';
+                    else if (ms < 200) pingLabel.style_class = 'quickvpn-ping-med';
+                    else pingLabel.style_class = 'quickvpn-ping-bad';
+                } else {
+                    pingLabel.text = '✗';
+                    pingLabel.style_class = 'quickvpn-ping-bad';
+                }
+            }
+            return { cleanName, ms };
+        });
+
+        Promise.all(promises).then(() => {
+            pingBtn.set_label(_('⚡ Пинг'));
+        });
+    }
+
+    _connectActive() {
+        const activeProfile = this._profiles.find(p => p.id === this._activeProfileId) || this._profiles[0];
+        if (!activeProfile) return;
+
+        if (!activeProfile.selectedNode && activeProfile.nodes?.length) {
+            activeProfile.selectedNode = decodeNodeName(activeProfile.nodes[0].name);
+            this._saveProfiles();
+        }
+
+        this._isConnected = true;
+        this._switch.setToggleState(true);
+        this._extension.callMihomo('start', activeProfile.id);
+        this._extension.enableProxy();
+        this._updateStatusUi(activeProfile);
+    }
+
+    _disconnect() {
+        this._isConnected = false;
+        this._switch.setToggleState(false);
+        this._extension.callMihomo('stop');
+        this._extension.disableProxy();
+        this._updateStatusUi(null);
+    }
+
+    _updateStatusUi(profile) {
+        if (this._isConnected && profile) {
+            const nodeName = decodeNodeName(profile.selectedNode || '');
+            this._statusBadge.text = `● ${nodeName}`;
+            this._statusBadge.style_class = 'quickvpn-badge-connected';
+            this._panelLabel.text = nodeName.substring(0, 16);
+            this._panelLabel.visible = true;
+        } else {
+            this._statusBadge.text = _('○ Отключено');
+            this._statusBadge.style_class = 'quickvpn-badge-disconnected';
+            this._panelLabel.text = '';
+            this._panelLabel.visible = false;
         }
     }
 
     _removeProfile(profile) {
-        const idx = this._profiles.indexOf(profile);
-        if (idx > -1) {
-            if (this._activeProfileId === profile.id) {
-                this._callMihomo('stop', profile.id);
-                this._activeProfileId = null;
-                this.checked = false;
-                this.emit('profile-deactivated');
-            }
-            this._profiles.splice(idx, 1);
-            this._saveProfiles();
-            this._rebuildMenu();
-            Main.notify(_('Quick VPN'), `${profile.label} removed`);
+        if (this._activeProfileId === profile.id && this._isConnected) {
+            this._disconnect();
         }
-    }
-
-    _saveConfig(profileId, body) {
-        try {
-            const configDir = `${this._storePath}/configs`;
-            GLib.mkdir_with_parents(configDir, 0o755);
-            GLib.file_set_contents(`${configDir}/${profileId}.yaml`, body);
-        } catch (e) {
-            logCrash(this._storePath, `Save config error: ${e}`);
-        }
-    }
-
-    _callMihomo(action, profileId, nodeName) {
-        const scriptPath = `${this._storePath}/mihomo_helper.py`;
-        const args = ['python3', scriptPath, this._storePath, action];
-        if (profileId) args.push(profileId);
-        if (nodeName) args.push(nodeName);
-
-        try {
-            const proc = Gio.Subprocess.new(
-                args,
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
-            );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
-                try {
-                    const [, stdout, stderr] = proc.communicate_utf8_finish(res);
-                    if (stdout?.trim()) logCrash(this._storePath, `mihomo: ${stdout.trim()}`);
-                    if (!proc.get_successful() && stderr?.trim()) {
-                        logCrash(this._storePath, `mihomo error: ${stderr.trim()}`);
-                    }
-                } catch (e) {
-                    logCrash(this._storePath, `mihomo callback error: ${e}`);
-                }
-            });
-        } catch (e) {
-            logCrash(this._storePath, `Failed to run mihomo: ${e}`);
-        }
+        this._profiles = this._profiles.filter(p => p.id !== profile.id);
+        this._activeProfileId = this._profiles.length > 0 ? this._profiles[0].id : null;
+        this._saveProfiles();
+        this._buildUi();
     }
 
     _fetchAndAddProfile(url) {
         if (this._isFetching) return;
         this._isFetching = true;
-        this.setStatus(_('Downloading...'));
+        Main.notify(_('Quick VPN'), _('Загрузка подписки...'));
 
         const hwid = getDeviceHwid(this._storePath);
         const args = [
@@ -436,19 +548,13 @@ const QuickVpnToggle = GObject.registerClass({
         ];
 
         try {
-            const proc = Gio.Subprocess.new(
-                args,
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
-            );
+            const proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
             proc.communicate_utf8_async(null, null, (proc, res) => {
                 this._isFetching = false;
                 try {
                     const [, stdout, stderr] = proc.communicate_utf8_finish(res);
                     if (!proc.get_successful()) {
-                        const errMsg = (stderr || '').trim() || 'curl error';
-                        logCrash(this._storePath, `Download failed: ${errMsg}`);
-                        Main.notify(_('Quick VPN'), `Download failed: ${errMsg}`);
-                        this.setStatus(_('Error'));
+                        Main.notify(_('Quick VPN'), `Ошибка загрузки: ${(stderr || '').trim()}`);
                         return;
                     }
 
@@ -471,203 +577,90 @@ const QuickVpnToggle = GObject.registerClass({
                     this._processConfig(url, body, subInfoRaw, profileTitleRaw);
                 } catch (e) {
                     logCrash(this._storePath, `Download callback error: ${e}`);
-                    Main.notify(_('Quick VPN'), 'Failed to download config');
-                    this.setStatus(_('Error'));
+                    Main.notify(_('Quick VPN'), _('Ошибка при разборе ответа'));
                 }
             });
         } catch (e) {
             this._isFetching = false;
-            logCrash(this._storePath, `Failed to run curl: ${e}`);
-            Main.notify(_('Quick VPN'), 'Failed to download config');
-            this.setStatus(_('Error'));
+            logCrash(this._storePath, `Curl error: ${e}`);
+            Main.notify(_('Quick VPN'), _('Не удалось запустить curl'));
         }
     }
 
     _processConfig(url, body, subInfoRaw, profileTitleRaw) {
-        const tmpDir = GLib.get_tmp_dir();
-        const tmpFile = `${tmpDir}/quickvpn-${Date.now()}.yaml`;
-
+        const tmpFile = `${this._storePath}/tmp_config_${Date.now()}`;
         try {
             GLib.file_set_contents(tmpFile, body);
-
-            const scriptPath = `${this._storePath}/parse_config.py`;
+            const script = `${this._storePath}/parse_config.py`;
             const proc = Gio.Subprocess.new(
-                ['python3', scriptPath, tmpFile, subInfoRaw, profileTitleRaw],
+                ['python3', script, tmpFile, subInfoRaw || '', profileTitleRaw || ''],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
-            proc.communicate_utf8_async(null, null, (proc, res) => {
-                try {
-                    const [, stdout, stderr] = proc.communicate_utf8_finish(res);
-                    if (!proc.get_successful()) {
-                        const parseErr = (stderr || '').trim() || 'parse error';
-                        logCrash(this._storePath, `Parse config failed: ${parseErr}`);
-                        Main.notify(_('Quick VPN'), `Parse error: ${parseErr}`);
-                        this.setStatus(_('Error'));
-                        GLib.remove(tmpFile);
-                        return;
-                    }
 
-                    const result = JSON.parse(stdout.trim());
-                    const label = result.label || parseLabelFromUrl(url) || getDomainFromUrl(url);
+            proc.communicate_utf8_async(null, null, (proc, res) => {
+                let stdout = '';
+                try {
+                    const [, out] = proc.communicate_utf8_finish(res);
+                    stdout = out;
+                    const result = JSON.parse(stdout);
+                    const id = String(Date.now());
+                    const label = result.label || 'VPN Profile';
+
                     const profile = {
-                        id: Date.now().toString(),
+                        id,
                         label,
                         url,
                         upload: result.upload || 0,
                         download: result.download || 0,
                         total: result.total || 0,
                         expire: result.expire || 0,
-                        nodes: result.proxies || [],
-                        selectedNode: '',
+                        nodes: (result.proxies || []).map(n => ({
+                            ...n,
+                            name: decodeNodeName(n.name),
+                        })),
+                        selectedNode: result.proxies?.[0] ? decodeNodeName(result.proxies[0].name) : '',
                     };
 
                     this._profiles.push(profile);
-                    this._saveConfig(profile.id, body);
+                    this._activeProfileId = id;
+                    this._saveConfig(id, body);
                     this._saveProfiles();
-                    this._rebuildMenu();
+                    this._buildUi();
 
-                    const usedGB = bytesToGB(profile.upload + profile.download);
-                    const totalGB = bytesToGB(profile.total);
-                    const traffic = profile.total
-                        ? `${usedGB}/${totalGB} GB`
-                        : `${usedGB} GB`;
-                    Main.notify(_('Quick VPN'),
-                        `${label}: ${profile.nodes.length} nodes, ${traffic}`);
+                    Main.notify(_('Quick VPN'), `Добавлено: ${label} (${profile.nodes.length} серверов)`);
                 } catch (e) {
-                    const raw = stdout ? stdout.trim().substring(0, 500) : '(empty)';
-                    logCrash(this._storePath, `Parse error: ${e}\n  stdout: ${raw}`);
-                    Main.notify(_('Quick VPN'), 'Failed to parse config');
-                    this.setStatus(_('Error'));
+                    logCrash(this._storePath, `Parse error: ${e}\nstdout: ${stdout}`);
+                    Main.notify(_('Quick VPN'), _('Ошибка разбора конфига'));
                 } finally {
                     GLib.remove(tmpFile);
                 }
             });
         } catch (e) {
             logCrash(this._storePath, `File error: ${e}`);
-            Main.notify(_('Quick VPN'), 'Failed to process config');
-            this.setStatus(_('Error'));
+            Main.notify(_('Quick VPN'), _('Ошибка сохранения конфига'));
         }
     }
 
-    _addFromEntry() {
-        const text = this._entry.get_text();
-        if (!text || text.trim().length === 0) {
-            Main.notify(_('Quick VPN'), _('Enter a subscription URL'));
-            return;
-        }
-
-        const configUrl = extractConfigUrl(text.trim());
-        if (!configUrl) {
-            Main.notify(_('Quick VPN'),
-                _('Enter a valid subscription URL or flclashx://install-config link'));
-            return;
-        }
-
-        this._fetchAndAddProfile(configUrl);
-        this._entry.set_text('');
-    }
-
-    _saveProfiles() {
-        if (!this._storePath) return;
+    _saveConfig(profileId, body) {
         try {
-            GLib.file_set_contents(
-                `${this._storePath}/profiles.json`,
-                JSON.stringify(this._profiles, null, 2)
-            );
+            const configDir = `${this._storePath}/configs`;
+            GLib.mkdir_with_parents(configDir, 0o755);
+            GLib.file_set_contents(`${configDir}/${profileId}.yaml`, body);
         } catch (e) {
-            logCrash(this._storePath, `Save error: ${e}`);
+            logCrash(this._storePath, `Save config error: ${e}`);
         }
-    }
-
-    loadProfiles() {
-        if (!this._storePath) return [];
-        try {
-            const [ok, contents] = GLib.file_get_contents(`${this._storePath}/profiles.json`);
-            if (ok && contents) {
-                const str = typeof contents === 'string' ? contents : new TextDecoder().decode(contents);
-                const profiles = JSON.parse(str);
-                for (const p of profiles) {
-                    if (p.selectedNode) p.selectedNode = decodeNodeName(p.selectedNode);
-                    if (p.nodes) {
-                        for (const n of p.nodes) {
-                            n.name = decodeNodeName(n.name);
-                        }
-                    }
-                }
-                return profiles;
-            }
-        } catch (e) {
-            logCrash(this._storePath, `Load error: ${e}`);
-        }
-        return [];
-    }
-
-    setStatus(text) {
-        this._statusItem.label.text = text;
-    }
-
-    _checkPing() {
-        const profilesToPing = this._profiles.length > 0 ? this._profiles : [];
-        if (profilesToPing.length === 0) return;
-
-        this._pingItem.setSensitive(false);
-        this._pingItem.label.text = _('Пингую...');
-
-        const allNodes = [];
-        for (const profile of profilesToPing) {
-            for (const node of (profile.nodes || [])) {
-                if (node.server) {
-                    allNodes.push({ profileLabel: profile.label, nodeName: node.name, server: node.server });
-                }
-            }
-        }
-
-        if (allNodes.length === 0) {
-            this._pingItem.setSensitive(true);
-            this._pingItem.label.text = _('Проверить пинг');
-            Main.notify(_('Quick VPN'), _('No nodes to ping'));
-            return;
-        }
-
-        const promises = allNodes.map(async (n) => {
-            const ping = await pingHost(n.server);
-            return { ...n, ping };
-        });
-
-        Promise.all(promises).then((results) => {
-            this._pingItem.setSensitive(true);
-            this._pingItem.label.text = _('Проверить пинг');
-
-            results.sort((a, b) => {
-                if (a.ping === null && b.ping === null) return 0;
-                if (a.ping === null) return 1;
-                if (b.ping === null) return -1;
-                return a.ping - b.ping;
-            });
-
-            let msg = '';
-            for (const r of results) {
-                const status = r.ping !== null ? `${r.ping}ms` : '✗';
-                const cleanNode = decodeNodeName(r.nodeName);
-                msg += `${r.profileLabel}: ${truncateText(cleanNode, 32)} — ${status}\n`;
-            }
-            Main.notify(_('Quick VPN — Ping'), msg.trim());
-        });
     }
 });
 
 export default class QuickVpnExtension extends Extension {
-    _callMihomo(action, profileId, nodeName) {
+    callMihomo(action, profileId, nodeName) {
         const scriptPath = `${this.path}/mihomo_helper.py`;
         const args = ['python3', scriptPath, this.path, action];
         if (profileId) args.push(profileId);
         if (nodeName) args.push(nodeName);
 
         try {
-            const proc = Gio.Subprocess.new(
-                args,
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
-            );
+            const proc = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
             proc.communicate_utf8_async(null, null, (proc, res) => {
                 try {
                     const [, stdout, stderr] = proc.communicate_utf8_finish(res);
@@ -696,7 +689,7 @@ export default class QuickVpnExtension extends Extension {
         this._savedSocksPort = s.get_int('socks-port');
     }
 
-    _enableProxy() {
+    enableProxy() {
         this._saveProxyState();
         const s = new Gio.Settings({ schema_id: 'org.gnome.system.proxy' });
         s.set_boolean('use-same-proxy', false);
@@ -710,7 +703,7 @@ export default class QuickVpnExtension extends Extension {
         this._proxyEnabled = true;
     }
 
-    _disableProxy() {
+    disableProxy() {
         if (!this._proxyEnabled) return;
         this._proxyEnabled = false;
         const s = new Gio.Settings({ schema_id: 'org.gnome.system.proxy' });
@@ -725,7 +718,6 @@ export default class QuickVpnExtension extends Extension {
     }
 
     enable() {
-        const iconPath = `${this.path}/icons/quickvpn-symbolic.svg`;
         this._proxyEnabled = false;
 
         try {
@@ -736,46 +728,20 @@ export default class QuickVpnExtension extends Extension {
             console.log(`Quick VPN: stylesheet load error: ${e}`);
         }
 
-        this._indicator = new QuickSettings.SystemIndicator();
-        this._indicator._indicator = this._indicator._addIndicator();
-        const iconFile = Gio.File.new_for_path(iconPath);
-        this._indicator._indicator.gicon = Gio.FileIcon.new(iconFile);
-        this._indicator._indicator.reactive = true;
-
-        this._toggle = new QuickVpnToggle(iconPath);
-        this._toggle.storePath = this.path;
-
-        this._indicator.quickSettingsItems.push(this._toggle);
-        QuickSettingsMenu.addExternalIndicator(this._indicator);
-
-        const profiles = this._toggle.loadProfiles();
-        this._toggle.setProfiles(profiles);
-        this._toggle.setStatus(profiles.length > 0 ? _('Select VPN') : _('No VPN'));
-
-        this._toggle.connect('profile-activated', (t, id) => {
-            logCrash(this.path, `Profile activated: ${id}`);
-            this._callMihomo('start', id);
-            this._enableProxy();
-        });
-
-        this._toggle.connect('profile-deactivated', () => {
-            this._callMihomo('stop');
-            this._disableProxy();
-        });
+        // Add standalone indicator button directly to top panel status area!
+        this._button = new QuickVpnButton(this);
+        Main.panel.addToStatusArea('quick-vpn', this._button);
     }
 
     disable() {
-        this._callMihomo('stop');
-        this._disableProxy();
+        this.callMihomo('stop');
+        this.disableProxy();
 
-        if (this._toggle) {
-            this._toggle.destroy();
-            this._toggle = null;
+        if (this._button) {
+            this._button.destroy();
+            this._button = null;
         }
-        if (this._indicator) {
-            this._indicator.destroy();
-            this._indicator = null;
-        }
+
         if (this._stylesheetId != null) {
             const themeContext = St.ThemeContext.get_for_stage(global.stage);
             themeContext.get_theme().unload_stylesheet(this._stylesheetId);
