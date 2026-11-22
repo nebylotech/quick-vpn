@@ -8,6 +8,20 @@ import { Extension, gettext as _ } from 'resource:///org/gnome/shell/extensions/
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
+
+const SHELL_VERSION = Number.parseInt(Config.PACKAGE_VERSION.split('.')[0], 10);
+
+function boxOrientation(isVertical = true) {
+    if (SHELL_VERSION >= 51) {
+        return {
+            orientation: isVertical
+                ? Clutter.Orientation.VERTICAL
+                : Clutter.Orientation.HORIZONTAL,
+        };
+    }
+    return { vertical: isVertical };
+}
 
 function bytesToGB(bytes) {
     if (!bytes) return '0.0';
@@ -192,9 +206,9 @@ class QuickVpnButton extends PanelMenu.Button {
         const headerCard = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
         headerCard.add_style_class_name('quickvpn-card');
 
-        const headerBox = new St.BoxLayout({ vertical: false, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+        const headerBox = new St.BoxLayout({ ...boxOrientation(false), x_expand: true, y_align: Clutter.ActorAlign.CENTER });
         
-        const titleBox = new St.BoxLayout({ vertical: true, x_expand: true });
+        const titleBox = new St.BoxLayout({ ...boxOrientation(true), x_expand: true });
         const appTitle = new St.Label({
             text: _('Quick VPN'),
             style_class: 'quickvpn-title',
@@ -238,10 +252,10 @@ class QuickVpnButton extends PanelMenu.Button {
         const profileCard = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
         profileCard.add_style_class_name('quickvpn-card');
 
-        const profileBox = new St.BoxLayout({ vertical: true, x_expand: true });
+        const profileBox = new St.BoxLayout({ ...boxOrientation(true), x_expand: true });
         
         // Profile Name Row
-        const profileTop = new St.BoxLayout({ vertical: false, x_expand: true });
+        const profileTop = new St.BoxLayout({ ...boxOrientation(false), x_expand: true });
         const profileName = new St.Label({
             text: activeProfile.label || _('Подписка'),
             style: 'font-weight: 800; font-size: 13px;',
@@ -258,7 +272,7 @@ class QuickVpnButton extends PanelMenu.Button {
         profileBox.add_child(profileTop);
 
         // Traffic & Expiry Badges Row
-        const statsRow = new St.BoxLayout({ vertical: false, style: 'margin-top: 6px;' });
+        const statsRow = new St.BoxLayout({ ...boxOrientation(false), style: 'margin-top: 6px;' });
         const usedGB = bytesToGB((activeProfile.upload || 0) + (activeProfile.download || 0));
         const totalGB = bytesToGB(activeProfile.total || 0);
         const trafficText = activeProfile.total ? `${usedGB} / ${totalGB} GB` : `${usedGB} GB`;
@@ -284,7 +298,7 @@ class QuickVpnButton extends PanelMenu.Button {
         // 3. Search Bar & Ping Action Header
         const controlsItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
         controlsItem.style = 'padding: 4px 6px;';
-        const controlsBox = new St.BoxLayout({ vertical: false, x_expand: true });
+        const controlsBox = new St.BoxLayout({ ...boxOrientation(false), x_expand: true });
 
         const searchEntry = new St.Entry({
             hint_text: _('🔍 Поиск сервера...'),
@@ -337,7 +351,7 @@ class QuickVpnButton extends PanelMenu.Button {
             });
             nodeItem._nodeName = cleanName;
 
-            const rowBox = new St.BoxLayout({ vertical: false, x_expand: true, y_align: Clutter.ActorAlign.CENTER });
+            const rowBox = new St.BoxLayout({ ...boxOrientation(false), x_expand: true, y_align: Clutter.ActorAlign.CENTER });
 
             // Radio bullet / dot
             const radioLabel = new St.Label({
@@ -397,7 +411,7 @@ class QuickVpnButton extends PanelMenu.Button {
 
         // 5. Actions: Remove profile / Add subscription
         const footerItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
-        const footerBox = new St.BoxLayout({ vertical: false, x_expand: true });
+        const footerBox = new St.BoxLayout({ ...boxOrientation(false), x_expand: true });
 
         const removeBtn = new St.Button({
             label: _('🗑 Удалить профиль'),
@@ -419,7 +433,7 @@ class QuickVpnButton extends PanelMenu.Button {
     _buildAddSection() {
         const addSection = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
         addSection.style = 'padding: 6px;';
-        const addBox = new St.BoxLayout({ vertical: false, x_expand: true });
+        const addBox = new St.BoxLayout({ ...boxOrientation(false), x_expand: true });
 
         const urlEntry = new St.Entry({
             hint_text: _('Вставьте ссылку подписки...'),

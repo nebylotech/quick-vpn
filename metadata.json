@@ -2,6 +2,7 @@
   "name": "Quick VPN",
   "description": "Manage VPN subscriptions from GNOME quick settings",
   "uuid": "quick-vpn@nolune",
+  "settings-schema": "org.gnome.shell.extensions.quick-vpn",
   "shell-version": ["50", "51"],
   "version": 2,
   "url": "https://github.com/nebylotech/quick-vpn",
